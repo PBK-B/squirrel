@@ -24,6 +24,9 @@ show_notifications_when: appropriate
 status_icon:
   show: true
 
+# whether to enable global sharing the same `ascii_mode`, default to false
+global_ascii: false
+
 style:
   color_scheme: native
   # Optional: define both light and dark color schemes to match system appearance
