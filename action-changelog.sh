@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 
-current=$(git describe --tags --abbrev=0)
+beta=$(git describe --tags --abbrev=0)
+current=$(git describe --tags --abbrev=0 --tags ${beta}^)
 previous=$(git describe --always --abbrev=0 --tags ${current}^)
 
-echo "**Change log since ${previous}:**"
+echo "![GitHub Downloads](https://img.shields.io/github/downloads/PBK-B/squirrel/${beta}/total)"
+echo ""
 
-git log --oneline --decorate ${previous}...${current} --pretty="format:- %h %s" | grep -v Merge
+echo "**Change log since ${beta}:**"
+
+git log --oneline --decorate ${previous}...${beta} --pretty="tformat:- %h %s" | grep -v Merge
