@@ -1,0 +1,288 @@
+name: Sync selfuse with upstream
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+  actions: read
+
+concurrency:
+  group: sync-selfuse
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # This workflow must run from the fork that owns the selfuse branch.
+    if: >-
+      github.repository != 'rime/squirrel' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    env:
+      BASE_BRANCH: selfuse
+      SYNC_BRANCH: sync-upstream-master-to-selfuse
+      UPSTREAM_REPOSITORY: rime/squirrel
+      UPSTREAM_BRANCH: master
+
+    steps:
+      - name: Check out selfuse
+        uses: actions/checkout@v4
+        with:
+          ref: selfuse
+          fetch-depth: 0
+
+      - name: Rebase selfuse onto upstream master
+        id: rebase
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          echo "base=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+          echo "upstream=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")" >> "${GITHUB_OUTPUT}"
+          git switch -C "${SYNC_BRANCH}"
+          git rebase "upstream/${UPSTREAM_BRANCH}"
+          echo "head=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Check for upstream changes
+        id: changes
+        run: |
+          set -eu
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "origin/${BASE_BRANCH}"; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Push the rebased branch
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          BASE_SHA: ${{ steps.rebase.outputs.base }}
+          UPSTREAM_SHA: ${{ steps.rebase.outputs.upstream }}
+          HEAD_SHA: ${{ steps.rebase.outputs.head }}
+        run: |
+          set -eu
+          git fetch --no-tags origin
+          test "$(git rev-parse "origin/${BASE_BRANCH}")" = "${BASE_SHA}"
+          # An immutable, bot-created tag binds this result to its original base.
+          metadata_ref="refs/tags/selfuse-rebase/${HEAD_SHA}"
+          metadata="$(jq -nc --arg base "${BASE_SHA}" --arg upstream "${UPSTREAM_SHA}" --arg head "${HEAD_SHA}" \
+            '{base: $base, upstream: $upstream, head: $head}')"
+          if git ls-remote --exit-code origin "${metadata_ref}" > /dev/null; then
+            git fetch origin "${metadata_ref}:${metadata_ref}"
+            test "$(git for-each-ref --format='%(contents)' "${metadata_ref}")" = "${metadata}"
+          else
+            git tag -a "selfuse-rebase/${HEAD_SHA}" -m "${metadata}" "${HEAD_SHA}"
+          fi
+          git push --atomic --force-with-lease origin "HEAD:${SYNC_BRANCH}" "${metadata_ref}:${metadata_ref}"
+
+      - name: Create or retain the selfuse pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_SHA: ${{ steps.rebase.outputs.base }}
+          UPSTREAM_SHA: ${{ steps.rebase.outputs.upstream }}
+          HEAD_SHA: ${{ steps.rebase.outputs.head }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+
+          pr_number="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number')"
+
+          cat > "${RUNNER_TEMP}/sync-pr-body.md" <<EOF
+          Automated rebase of \`selfuse\` onto \`rime/squirrel:master\`.
+
+          **To apply: @${REPOSITORY_OWNER} must use Review changes > Approve > Submit review.**
+          Do not use GitHub's Merge, Squash, or Rebase and merge buttons.
+          Approval rewrites \`selfuse\` to the reviewed result, preserving upstream commit SHAs.
+          The workflow backs up the old branch, applies with an exact force-with-lease, then closes this PR.
+          Any change to the PR head or original base requires a fresh sync/review.
+
+          - Original selfuse: ${BASE_SHA}
+          - Upstream master: ${UPSTREAM_SHA}
+          - Rebased result: ${HEAD_SHA}
+
+          Existing check runs and commit statuses must pass before approval; absent checks do not block application.
+          PRs pushed with GITHUB_TOKEN do not automatically trigger other PR workflows.
+          Files changed uses the merge base and may include replayed selfuse patches; inspect the comparisons below too.
+
+          <details>
+          <summary>Final content changes (old selfuse versus rebased result)</summary>
+
+          \`\`\`text
+          $(git diff --stat "${BASE_SHA}" "${HEAD_SHA}")
+          \`\`\`
+          </details>
+
+          <details>
+          <summary>Selfuse patch comparison (range-diff)</summary>
+
+          \`\`\`text
+          $(git -c color.ui=false range-diff "${UPSTREAM_SHA}..${BASE_SHA}" "${UPSTREAM_SHA}..${HEAD_SHA}" | head -c 40000)
+          \`\`\`
+          </details>
+          EOF
+
+          if [ -n "${pr_number}" ]; then
+            gh pr edit "${pr_number}" --repo "${GITHUB_REPOSITORY}" \
+              --body-file "${RUNNER_TEMP}/sync-pr-body.md" \
+              --add-reviewer "${REPOSITORY_OWNER}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --reviewer "${REPOSITORY_OWNER}" \
+              --title "Sync selfuse with upstream master" \
+              --body-file "${RUNNER_TEMP}/sync-pr-body.md"
+          fi
+
+  apply-rebase:
+    if: >-
+      github.repository != 'rime/squirrel' &&
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'approved' &&
+      github.event.review.user.login == github.repository_owner &&
+      github.event.pull_request.base.ref == 'selfuse' &&
+      github.event.pull_request.head.ref == 'sync-upstream-master-to-selfuse' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      BASE_BRANCH: selfuse
+      SYNC_BRANCH: sync-upstream-master-to-selfuse
+      REVIEWED_SHA: ${{ github.event.review.commit_id }}
+    steps:
+      - name: Validate the current PR, review, and checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const {data: pr} = await github.rest.pulls.get({owner, repo, pull_number});
+            const {data: review} = await github.rest.pulls.getReview({
+              owner, repo, pull_number, review_id: context.payload.review.id
+            });
+            if (pr.state !== 'open' || pr.draft || pr.user.login !== 'github-actions[bot]' ||
+                pr.base.repo.full_name !== context.payload.repository.full_name ||
+                pr.head.repo.full_name !== context.payload.repository.full_name ||
+                pr.base.ref !== 'selfuse' || pr.head.ref !== 'sync-upstream-master-to-selfuse' ||
+                review.user.login !== context.payload.repository.owner.login || review.state !== 'APPROVED' ||
+                review.commit_id !== pr.head.sha || review.commit_id !== process.env.REVIEWED_SHA) {
+              throw new Error('The PR or approval is stale or is not an authorized sync approval.');
+            }
+            const runs = await github.paginate(github.rest.checks.listForRef, {
+              owner, repo, ref: pr.head.sha, filter: 'latest', per_page: 100
+            });
+            // Ignore this workflow's own suites, including failed attempts that can be retried.
+            const ownRun = await github.rest.actions.getWorkflowRun({owner, repo, run_id: context.runId});
+            const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner, repo, workflow_id: ownRun.data.workflow_id, head_sha: pr.head.sha, per_page: 100
+            });
+            const ownSuites = new Set(workflowRuns.map(run => run.check_suite_id));
+            ownSuites.add(ownRun.data.check_suite_id);
+            const blocked = runs.filter(run => !ownSuites.has(run.check_suite?.id) &&
+              (run.status !== 'completed' || !['success', 'neutral', 'skipped'].includes(run.conclusion)));
+            const {data: statuses} = await github.rest.repos.getCombinedStatusForRef({
+              owner, repo, ref: pr.head.sha, per_page: 100
+            });
+            if (blocked.length || (statuses.total_count > 0 && statuses.state !== 'success')) {
+              throw new Error('Checks are pending or unsuccessful. Approve again after they pass.');
+            }
+
+      # Never check out or execute code from the PR while holding the write token.
+      - name: Initialize a Git-only workspace
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/apply-selfuse"
+          git init "${RUNNER_TEMP}/apply-selfuse"
+          cd "${RUNNER_TEMP}/apply-selfuse"
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          gh auth setup-git
+          git fetch --no-tags origin \
+            "refs/heads/${BASE_BRANCH}:refs/remotes/origin/${BASE_BRANCH}" \
+            "refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" \
+            "refs/tags/selfuse-rebase/${REVIEWED_SHA}:refs/tags/selfuse-rebase/${REVIEWED_SHA}"
+
+      - name: Back up and apply the approved rebase
+        id: apply
+        run: |
+          set -eu
+          cd "${RUNNER_TEMP}/apply-selfuse"
+          metadata_ref="refs/tags/selfuse-rebase/${REVIEWED_SHA}"
+          test "$(git cat-file -t "${metadata_ref}")" = tag
+          test "$(git rev-parse "${metadata_ref}^{commit}")" = "${REVIEWED_SHA}"
+          metadata="$(git for-each-ref --format='%(contents)' "${metadata_ref}")"
+          base="$(echo "${metadata}" | jq -er '.base | select(test("^[0-9a-f]{40}$"))')"
+          upstream="$(echo "${metadata}" | jq -er '.upstream | select(test("^[0-9a-f]{40}$"))')"
+          test "$(echo "${metadata}" | jq -er '.head')" = "${REVIEWED_SHA}"
+          test "$(git rev-parse "origin/${SYNC_BRANCH}")" = "${REVIEWED_SHA}"
+          test "$(git rev-parse "origin/${BASE_BRANCH}")" = "${base}"
+          git merge-base --is-ancestor "${upstream}" "${REVIEWED_SHA}"
+          # One atomic transaction: either the backup and branch update both land, or neither does.
+          backup="backup/selfuse/${base}"
+          git push --atomic \
+            --force-with-lease="refs/heads/${BASE_BRANCH}:${base}" \
+            origin "${base}:refs/heads/${backup}" "${REVIEWED_SHA}:refs/heads/${BASE_BRANCH}"
+          echo "base=${base}" >> "${GITHUB_OUTPUT}"
+          echo "backup=${backup}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the result and close the PR
+        uses: actions/github-script@v7
+        env:
+          OLD_SHA: ${{ steps.apply.outputs.base }}
+          BACKUP_BRANCH: ${{ steps.apply.outputs.backup }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            await github.rest.issues.createComment({owner, repo, issue_number, body:
+              `Applied the rebase approved by @${owner}.\n\n` +
+              `- Previous selfuse: \`${process.env.OLD_SHA}\`\n` +
+              `- Current selfuse: \`${process.env.REVIEWED_SHA}\`\n` +
+              `- Backup branch: \`${process.env.BACKUP_BRANCH}\`\n\n` +
+              `Closing this PR after a history replacement, not a GitHub merge. ` +
+              `Local copies of selfuse must be realigned; protect uncommitted work first.`
+            });
+            await github.rest.pulls.update({owner, repo, pull_number: issue_number, state: 'closed'});
+
+      - name: Report an unsuccessful application
+        if: failure()
+        uses: actions/github-script@v7
+        env:
+          APPLY_OUTCOME: ${{ steps.apply.outcome }}
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const url = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const message = process.env.APPLY_OUTCOME === 'success'
+              ? 'The rebase was applied, but recording the result or closing the PR failed. Inspect selfuse before retrying.'
+              : 'The approved rebase could not be applied. Check the run for stale revisions, failing checks, or branch protection restrictions. Refresh the sync if needed, then approve the latest result again.';
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: context.payload.pull_request.number,
+              body: `${message}\n\n[Workflow run](${url})`
+            });
+
+  workflow-keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@v1
