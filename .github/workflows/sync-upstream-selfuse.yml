@@ -1,0 +1,94 @@
+name: Sync selfuse with upstream
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-selfuse
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # This workflow must run from the fork that owns the selfuse branch.
+    if: github.repository != 'rime/squirrel'
+    runs-on: ubuntu-latest
+    env:
+      BASE_BRANCH: selfuse
+      SYNC_BRANCH: sync-upstream-master-to-selfuse
+      UPSTREAM_REPOSITORY: rime/squirrel
+      UPSTREAM_BRANCH: master
+
+    steps:
+      - name: Check out selfuse
+        uses: actions/checkout@v4
+        with:
+          ref: selfuse
+          fetch-depth: 0
+
+      - name: Rebase selfuse onto upstream master
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git switch -C "${SYNC_BRANCH}"
+          git rebase "upstream/${UPSTREAM_BRANCH}"
+
+      - name: Check for upstream changes
+        id: changes
+        run: |
+          set -eu
+          if git diff --quiet "origin/${BASE_BRANCH}" HEAD; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Push the rebased branch
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          set -eu
+          git fetch --no-tags origin
+          git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
+
+      - name: Create or retain the selfuse pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          pr_number="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number')"
+
+          if [ -n "${pr_number}" ]; then
+            echo "Keeping pull request #${pr_number}; the force-push updated it."
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "Sync selfuse with upstream master" \
+              --body 'Automated daily rebase of `selfuse` onto `rime/squirrel:master`.'
+          fi
+
+  workflow-keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@v1
