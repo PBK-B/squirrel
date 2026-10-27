@@ -1,0 +1,150 @@
+name: Notify Homebrew tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  notify:
+    if: github.repository == 'PBK-B/squirrel'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require a version tag
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$REF_TYPE" = tag || { echo 'Run this workflow on the release tag, not a branch.' >&2; exit 1; }
+          [[ "$TAG" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(beta|rc)\.(0|[1-9][0-9]*))?$ ]] || {
+            echo 'Expected a tag such as 1.1.2-beta.5' >&2; exit 1;
+          }
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Verify release and prepare Cask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release.json"
+          gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha > "$RUNNER_TEMP/tag-sha"
+          test "$(cat "$RUNNER_TEMP/tag-sha")" = "$GITHUB_SHA" || {
+            echo 'The tag commit does not match this workflow run.' >&2; exit 1;
+          }
+          ruby <<'RUBY'
+          require "digest"
+          require "json"
+          require "open-uri"
+          require "pathname"
+
+          directory = Pathname(ENV.fetch("RUNNER_TEMP"))
+          tag = ENV.fetch("TAG")
+          repository = ENV.fetch("GITHUB_REPOSITORY")
+          release = JSON.parse((directory / "release.json").read)
+          raise "Expected the published release" if release.fetch("draft") || release.fetch("tag_name") != tag
+          assets = release.fetch("assets").select { |asset| /\ASquirrel-.*\.pkg\z/.match?(asset.fetch("name")) }
+          raise "Expected exactly one Squirrel installer" unless assets.length == 1
+          asset = assets.first
+          name = asset.fetch("name")
+          raise "Unsafe installer filename" unless /\ASquirrel-[A-Za-z0-9][A-Za-z0-9._-]*\.pkg\z/.match?(name)
+          url = "https://github.com/#{repository}/releases/download/#{tag}/#{name}"
+          raise "Unexpected or incomplete asset" unless asset.fetch("state") == "uploaded" && asset.fetch("browser_download_url") == url
+          digest = Digest::SHA256.new
+          size = 0
+          URI.open(url, open_timeout: 30, read_timeout: 180) do |input|
+            while (chunk = input.read(1024 * 1024))
+              digest.update(chunk)
+              size += chunk.bytesize
+            end
+          end
+          raise "Incomplete installer download" unless size.positive? && size == asset.fetch("size")
+          checksum = digest.hexdigest
+          raise "Asset digest mismatch" if asset["digest"] && asset["digest"] != "sha256:#{checksum}"
+          (directory / "squirrel.rb").write(<<~RECIPE)
+            cask "squirrel" do
+              version "#{tag.delete_prefix('v')}"
+              sha256 "#{checksum}"
+
+              url "#{url}"
+              name "Squirrel"
+              desc "Customized Rime input method for macOS"
+              homepage "https://github.com/#{repository}"
+
+              depends_on macos: :ventura
+
+              pkg "#{name}"
+
+              uninstall pkgutil: "im.rime.inputmethod.Squirrel",
+                        delete:  "/Library/Input Methods/Squirrel.app"
+
+              caveats <<~EOS
+                This package replaces Squirrel.app in /Library/Input Methods.
+                Your Rime configuration and dictionaries are preserved.
+                Migrate an existing Homebrew squirrel-app record before installation;
+                uninstalling that old cask afterwards can delete this application.
+                Use brew upgrade --cask zmide/tap/squirrel to update this build.
+              EOS
+            end
+          RECIPE
+          RUBY
+      - name: Send OIDC-authenticated recipe to tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPOSITORY: zmide/homebrew-tap
+          PACKAGE: squirrel
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby <<'RUBY'
+          require "digest"
+          require "json"
+          require "net/http"
+          require "uri"
+
+          begin
+            repository = ENV.fetch("GITHUB_REPOSITORY")
+            tap = ENV.fetch("TAP_REPOSITORY")
+            recipe = File.read(File.join(ENV.fetch("RUNNER_TEMP"), "squirrel.rb"), encoding: "UTF-8")
+            raise "Invalid recipe size or encoding" unless recipe.valid_encoding? && !recipe.include?("\0") && recipe.bytesize.between?(1, 32 * 1024)
+            token = ENV.fetch("GH_TOKEN")
+            raise "Configure HOMEBREW_TAP_TOKEN" if token.empty?
+            payload = { "repository" => repository, "package" => ENV.fetch("PACKAGE"), "tag" => ENV.fetch("TAG"), "recipe" => recipe }
+            fields = ["v1", tap.downcase, repository.downcase, payload.fetch("package"), payload.fetch("tag"), Digest::SHA256.hexdigest(recipe)]
+            audience = "homebrew-update:v1:#{tap.downcase}:#{Digest::SHA256.hexdigest(JSON.generate(fields))}"
+            uri = URI(ENV.fetch("ACTIONS_ID_TOKEN_REQUEST_URL"))
+            raise "Unexpected OIDC endpoint" unless uri.is_a?(URI::HTTPS) && !uri.userinfo
+            query = URI.decode_www_form(uri.query.to_s).reject { |key, _| key == "audience" }
+            uri.query = URI.encode_www_form(query + [["audience", audience]])
+            request = Net::HTTP::Get.new(uri)
+            request["Authorization"] = "Bearer #{ENV.fetch('ACTIONS_ID_TOKEN_REQUEST_TOKEN')}"
+            response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 30, read_timeout: 60) { |http| http.request(request) }
+            raise "OIDC request failed" unless response.is_a?(Net::HTTPSuccess)
+            payload["identity_token"] = JSON.parse(response.body).fetch("value")
+            raise "Dispatch payload too large" if JSON.generate(payload).bytesize > 65_535
+            uri = URI("https://api.github.com/repos/#{tap}/dispatches")
+            request = Net::HTTP::Post.new(uri)
+            request["Authorization"] = "Bearer #{token}"
+            request["Accept"] = "application/vnd.github+json"
+            request["Content-Type"] = "application/json"
+            request["User-Agent"] = "squirrel-homebrew-notifier"
+            request.body = JSON.generate("event_type" => "update-package", "client_payload" => payload)
+            response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 30, read_timeout: 60) { |http| http.request(request) }
+            raise "Dispatch failed" unless response.code == "204"
+            puts "Package update queued; inspect Update package in the tap for publication status."
+          rescue StandardError => error
+            # Never expose HTTP bodies, request credentials or OIDC JWTs in logs.
+            warn "Notification failed (#{error.class}); check credentials, permissions and request limits."
+            exit 1
+          end
+          RUBY
